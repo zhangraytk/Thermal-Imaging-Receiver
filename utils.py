@@ -1,10 +1,24 @@
-import os
+import csv
 import time
-import pygame
+from pathlib import Path
 
 SCALE = 20
-ORIG_SURF = pygame.Surface((32, 24))
-PIX_ARRAY = pygame.PixelArray(ORIG_SURF)
+ORIG_SURF = None
+PIX_ARRAY = None
+
+
+def get_pygame():
+    import pygame
+    return pygame
+
+
+def get_pixel_array():
+    global ORIG_SURF, PIX_ARRAY
+    if PIX_ARRAY is None:
+        pygame = get_pygame()
+        ORIG_SURF = pygame.Surface((32, 24))
+        PIX_ARRAY = pygame.PixelArray(ORIG_SURF)
+    return PIX_ARRAY
 
 def get_colour(value):
     R_colour, G_colour, B_colour = 0, 0, 0
@@ -85,6 +99,7 @@ def draw_heatmap(matrix, draw_func):
 
 
 def draw_heatmap_upsample(matrix):
+    pix_array = get_pixel_array()
     max_t, min_t, avg_t = matrix[:3]
     max_t += 0.1
     for k, temp in enumerate(matrix[3::]):
@@ -92,15 +107,21 @@ def draw_heatmap_upsample(matrix):
         r, g, b = get_colour(value)
         x = k % 32
         y = k // 32
-        PIX_ARRAY[x, 23-y] = (r, g, b)
-    return pygame.transform.smoothscale(PIX_ARRAY.make_surface(), (32*SCALE, 24*SCALE))
+        pix_array[x, 23-y] = (r, g, b)
+    pygame = get_pygame()
+    return pygame.transform.smoothscale(pix_array.make_surface(), (32*SCALE, 24*SCALE))
 
 
-def save_frame(matrix:list, surf:pygame.Surface):
+def save_frame(matrix:list, surf, output_dir=None):
+    pygame = get_pygame()
+    output_dir = Path(output_dir) if output_dir else Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%m-%d-%H-%M-%S")
+    csv_path = output_dir / f"{timestamp}.csv"
+    image_path = output_dir / f"{timestamp}.png"
     lines = []
     line = []
     for k, data in enumerate(matrix[3::]):
-    # for k, data in enumerate([i for i in range(768)]):
         if k  %  32 != 0:
             line.append(data)
         elif len(line) > 0:
@@ -110,36 +131,29 @@ def save_frame(matrix:list, surf:pygame.Surface):
         else:
             line.append(data)
     lines.insert(0, line)
-    with open(f'{time.strftime("%m-%d-%H-%M-%S")}.csv', 'w', encoding="utf-8") as f:
-        f.write(' ,')
-        [f.write(f"{k},") for k, _ in enumerate(lines[0])]
-        f.write('\n')
+    with csv_path.open('w', encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + list(range(len(lines[0]))))
         for k, line in enumerate(lines):
-            f.write(f"{k},")
-            for data in line:
-                f.write(f"{data},")
-            f.write('\n')
+            writer.writerow([k] + line)
     
     cap_rect = pygame.Rect(0, 50, 20*32, 20*24)
     screen_cap = surf.subsurface(cap_rect)
-    pygame.image.save(screen_cap, f'{time.strftime("%m-%d-%H-%M-%S")}.png')
+    pygame.image.save(screen_cap, image_path)
+    return csv_path, image_path
 
-def save_curv(times:list, points_bytime:list):
-    with open(f'curv_{time.strftime("%m-%d-%H-%M-%S")}.csv', 'w', encoding="utf-8") as f:
-        # by_point = [[] for _ in range(len(times))]
-        # for _time in times:
-        #     f.write(f"{_time},")
-        # f.write('\n')
-        # for time_stamps in points_bytime:
-        #     for point in time_stamps:
-        #         f.write(f"{point},")
-        #     f.write('\n')
-        f.write("time(s),max,")
-        for i in range(len(points_bytime[0])-1):
-            f.write(f"point_{i},")
-        f.write('\n')
+def save_curv(times:list, points_bytime:list, output_dir=None):
+    if not times or not points_bytime:
+        return None
+
+    output_dir = Path(output_dir) if output_dir else Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / f'curv_{time.strftime("%m-%d-%H-%M-%S")}.csv'
+    with csv_path.open('w', encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        header = ["time(s)", "max"]
+        header.extend(f"point_{i}" for i in range(len(points_bytime[0]) - 1))
+        writer.writerow(header)
         for t, time_stamps in enumerate(points_bytime):
-            f.write(f'{times[t]:.3f},')
-            for temp in time_stamps:
-                f.write(f"{temp},")
-            f.write('\n')
+            writer.writerow([f"{times[t]:.3f}"] + time_stamps)
+    return csv_path

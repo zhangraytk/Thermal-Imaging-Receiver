@@ -1,0 +1,29 @@
+[project]
+name = "thermal-imaging-receiver"
+version = "0.1.0"
+description = "A cross-platform serial thermal imaging receiver."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib",
+    "pygame-ce",
+    "pygame_gui",
+    "pyserial",
+]
+
+[project.scripts]
+thermal-receiver = "main:main"
+thermal-plotter = "ploter:main"
+
+[tool.setuptools]
+py-modules = [
+    "app_config",
+    "frame_parser",
+    "main",
+    "ploter",
+    "utils",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

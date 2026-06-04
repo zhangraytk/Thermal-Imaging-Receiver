@@ -2,9 +2,12 @@ import pygame
 import pygame_gui
 import serial
 import serial.tools.list_ports
+import sys
 import threading
 import queue
-import struct
+import time
+from app_config import load_config
+from frame_parser import FrameParseError, parse_frame_packet
 from utils import *
 
 pygame.init()
@@ -13,7 +16,8 @@ pygame.mouse.set_visible(False)
 FONT = pygame.font.Font(None, 25)  # 使用默认字体，大小为72
 SERIAL = serial.Serial()
 SERIAL.timeout = 2
-IDENTIFY = queue.Queue(3)
+FRAME_QUEUE = queue.Queue(2)
+ERROR_QUEUE = queue.Queue(5)
 IMG_BUFFER = None
 REC = False
 IDENTIFY_BUFFER = b""
@@ -22,13 +26,16 @@ SCALE = 20
 REC_INTERVAL = 0.25
 MAX_REC_TIME = 3600 * 5
 
-ERROR = None
 DISPLAY_MODE = "SCALED"
 SURF_IMG = pygame.Surface((32*SCALE, 24*SCALE))
 REC_LAST_TIME = time.time()
 TIME_REC_LIST = []
 POINTS_REC_LIST = []
 REC_BEGIN_TIME = time.time()
+APP_CONFIG = load_config(create_data_dir=True)
+DATA_DIR = APP_CONFIG["data_dir"]
+BAUDRATE = int(APP_CONFIG["baudrate"])
+REC_INTERVAL = float(APP_CONFIG["record_interval"])
 
 
 class Serial_Manager():
@@ -38,8 +45,10 @@ class Serial_Manager():
     
     def scan_ports(self):
         options = serial.tools.list_ports.comports()
+        if sys.platform == "darwin":
+            options = sorted(options, key=lambda item: (not item.device.startswith("/dev/cu."), item.device))
         ports = [i.device for i in options]
-        names = [i.description for i in options]
+        names = [f"{i.description} ({i.device})" for i in options]
         self.ports = ports
         self.names = names
         return ports, names
@@ -61,7 +70,6 @@ class myUIDropDownMenu(pygame_gui.elements.UIDropDownMenu):
             if event.ui_object_id in ["drop_down_menu.#expand_button", "drop_down_menu.#selected_option"]:
                 if self.current_state != self.menu_states['expanded']:
                     self.update_ports()
-                    print(self.dic_ports)
 
         if self.is_enabled:
             consumed_event = self.current_state.process_event(event)
@@ -76,7 +84,7 @@ class myUIDropDownMenu(pygame_gui.elements.UIDropDownMenu):
         if self.selected_option[0] not in names:
             self.selected_option = self.options_list[0]
         
-        for i in self.options_list:
+        for i in list(self.options_list):
             if i[0] not in ["断开连接"]:
                 self.remove_options([i[0]])
         
@@ -85,79 +93,53 @@ class myUIDropDownMenu(pygame_gui.elements.UIDropDownMenu):
             self.add_options([name])
 
 def thread_serial():
-    global IDENTIFY_BUFFER, ALIVE, SERIAL, IMG_BUFFER, ERROR
-    nums = []
+    global IDENTIFY_BUFFER, ALIVE, SERIAL
     while ALIVE:
-        if SERIAL.is_open:
-            try:
-                IDENTIFY_BUFFER = SERIAL.read_until(b"END")
-            except Exception as e:
-                IDENTIFY_BUFFER = b""
-                ERROR = e
+        if not SERIAL.is_open:
+            time.sleep(0.05)
+            continue
 
-            # 期望数据格式: b'BEGIN' + payload (n floats little-endian) + b'END'
-            if IDENTIFY_BUFFER.startswith(b"BEGIN") and IDENTIFY_BUFFER.endswith(b"END"):
-                payload = IDENTIFY_BUFFER[5:-3]
-                # payload 长度应为 4 的倍数
-                if len(payload) % 4 == 0 and len(payload) >= 12:  # 至少包含 3 个 float (12 bytes)
-                    num_floats = len(payload) // 4
-                    try:
-                        values = struct.unpack(f"<{num_floats}f", payload)
-                    except Exception as e:
-                        IMG_BUFFER = None
-                        ERROR = e
-                        continue
+        try:
+            IDENTIFY_BUFFER = SERIAL.read_until(b"END")
+        except Exception as e:
+            IDENTIFY_BUFFER = b""
+            put_queue_latest(ERROR_QUEUE, e)
+            continue
 
-                    # 假设前 3 个 float 是 max/min/avg，后面是像素数据
-                    if num_floats >= 3:
-                        header = values[:3]
-                        pixels = list(values[3:])
-                        src_pixel_count = len(pixels)
+        try:
+            frame = parse_frame_packet(IDENTIFY_BUFFER)
+        except FrameParseError:
+            continue
+        put_queue_latest(FRAME_QUEUE, frame)
 
-                        # 原始 24x32: 24*32 = 768
-                        if src_pixel_count == 768:
-                            # 直接使用原始缓冲区（保持原有顺序）
-                            IMG_BUFFER = tuple(values)
-                            # print("[serial] received 24x32 frame (768 pixels)")
-                        elif src_pixel_count == 192:
-                            # 12x16 探头 -> 上采样到 24x32
-                            def upsample_bilinear(src, src_w, src_h, dst_w, dst_h):
-                                out = []
-                                for ty in range(dst_h):
-                                    y = ty * (src_h - 1) / (dst_h - 1)
-                                    y0 = int(y)
-                                    y1 = min(y0 + 1, src_h - 1)
-                                    wy = y - y0
-                                    for tx in range(dst_w):
-                                        x = tx * (src_w - 1) / (dst_w - 1)
-                                        x0 = int(x)
-                                        x1 = min(x0 + 1, src_w - 1)
-                                        wx = x - x0
-                                        v00 = src[y0 * src_w + x0]
-                                        v01 = src[y0 * src_w + x1]
-                                        v10 = src[y1 * src_w + x0]
-                                        v11 = src[y1 * src_w + x1]
-                                        val = (1 - wx) * (1 - wy) * v00 + wx * (1 - wy) * v01 + (1 - wx) * wy * v10 + wx * wy * v11
-                                        out.append(val)
-                                return out
 
-                            # 传感器实际为 16x12（宽16，高12），因此 src_w=16, src_h=12
-                            up_pixels = upsample_bilinear(pixels, 16, 12, 32, 24)
-                            IMG_BUFFER = tuple([header[0], header[1], header[2]] + up_pixels)
-                            # print(f"[serial] received 12x16 frame (192 pixels), upsampled to {len(up_pixels)} pixels")
-                            # 打印少量样本用于调试
-                            # print("[serial] header:", header)
-                            # print("[serial] src pixels sample:", pixels[:8])
-                            # print("[serial] upsample sample:", up_pixels[:8])
-                        else:
-                            # 未知像素数，忽略本帧
-                            IMG_BUFFER = None
-                    else:
-                        IMG_BUFFER = None
-                else:
-                    IMG_BUFFER = None
-            else:
-                IMG_BUFFER = None
+def put_queue_latest(target_queue, value):
+    try:
+        target_queue.put_nowait(value)
+    except queue.Full:
+        try:
+            target_queue.get_nowait()
+        except queue.Empty:
+            pass
+        target_queue.put_nowait(value)
+
+
+def drain_latest_frame():
+    frame = None
+    while True:
+        try:
+            frame = FRAME_QUEUE.get_nowait()
+        except queue.Empty:
+            return frame
+
+
+def drain_latest_error():
+    error = None
+    while True:
+        try:
+            error = ERROR_QUEUE.get_nowait()
+        except queue.Empty:
+            return error
 
 def draw_func(surf, k, color):
     y = k  // 32
@@ -210,18 +192,33 @@ def change_mode():
     DISPLAY_MODE = "SCALED" if DISPLAY_MODE == "ORIGINAL" else "ORIGINAL"
 
 
+def format_serial_error(error):
+    message = str(error)
+    if sys.platform.startswith("linux") and "Permission" in message:
+        message += "，请确认当前用户有 dialout 权限"
+    return message
+
+
+def stop_recording():
+    global REC, TIME_REC_LIST, POINTS_REC_LIST
+    REC = False
+    path = save_curv(TIME_REC_LIST, POINTS_REC_LIST, DATA_DIR)
+    TIME_REC_LIST = []
+    POINTS_REC_LIST = []
+    return path
+
+
 def rec_trigger():
-    global REC, TIME_REC_LIST, POINTS_REC_LIST, REC_BEGIN_TIME
+    global REC, TIME_REC_LIST, POINTS_REC_LIST, REC_BEGIN_TIME, REC_LAST_TIME
     if not SERIAL.is_open:
         return None
     if not REC:
-        REC = True
-        REC_BEGIN_TIME = time.time()
-    else:
-        REC = False
-        save_curv(TIME_REC_LIST, POINTS_REC_LIST)
         TIME_REC_LIST = []
         POINTS_REC_LIST = []
+        REC = True
+        REC_BEGIN_TIME = REC_LAST_TIME = time.time()
+        return None
+    return stop_recording()
 
 def rec_loop(temps:list):
     global REC, TIME_REC_LIST, POINTS_REC_LIST, REC_LAST_TIME
@@ -235,7 +232,7 @@ def rec_loop(temps:list):
             
 
 def main():
-    global ALIVE, ERROR
+    global ALIVE, IMG_BUFFER
     mouse_pos = (0,0)
     test_points = []
     test_temps = []
@@ -286,26 +283,39 @@ def main():
             if event.type == pygame.QUIT:
                 is_running = False
                 ALIVE = False
-                rec_trigger()
+                if REC:
+                    stop_recording()
             elif event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
                 test_points.clear()
+                if REC:
+                    saved_path = stop_recording()
+                    button_rec.set_text('录制曲线')
+                    msg = f'录制完成：{saved_path.name}' if saved_path else '录制已结束，无数据'
+                if event.text == "断开连接":
+                    if SERIAL.is_open:
+                        SERIAL.close()
+                    IMG_BUFFER = None
+                    msg = f"{msg}，已断开连接" if msg else "已断开连接"
+                    manager.process_events(event)
+                    continue
                 try:
                     if SERIAL.is_open:
                         SERIAL.close()
                     SERIAL.port = port_list.dic_ports[event.text]
-                    SERIAL.baudrate = 921600
+                    SERIAL.baudrate = BAUDRATE
                     SERIAL.open()
-                    msg = ""
+                    msg = f"已连接 {SERIAL.port}"
                 except Exception as e:
                     SERIAL.close()
                     port_list.set_disconnected()
-                    msg = str(e)
+                    msg = format_serial_error(e)
             elif event.type == pygame_gui.UI_BUTTON_PRESSED:
                 if event.ui_element == button_save:
                     if IMG_BUFFER is not None:
-                        save_frame(IMG_BUFFER, window_surface)
+                        csv_path, image_path = save_frame(IMG_BUFFER, window_surface, DATA_DIR)
+                        msg = f"已保存 {csv_path.name} / {image_path.name}"
                     else:
-                        ERROR = '未连接串口'
+                        msg = '未连接串口'
                 elif event.ui_element == button_scale:
                     change_mode()
                     if DISPLAY_MODE == "SCALED":
@@ -316,13 +326,13 @@ def main():
                     if len(test_points) == 0:
                         msg = '请先选择测温点'
                     else:
-                        rec_trigger()
+                        saved_path = rec_trigger()
                         if REC:
                             button_rec.set_text('结束录制')
                             msg = '曲线录制中'
                         else:
                             button_rec.set_text('录制曲线')
-                            msg = '录制完成'
+                            msg = f'录制完成：{saved_path.name}' if saved_path else '录制已结束，无数据'
             elif event.type == pygame.MOUSEMOTION:
                 mouse_pos = event.pos
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -341,17 +351,25 @@ def main():
             manager.process_events(event)
 
         manager.update(time_delta)
+        latest_frame = drain_latest_frame()
+        if latest_frame is not None:
+            IMG_BUFFER = latest_frame
+
+        serial_error = drain_latest_error()
+        if serial_error is not None:
+            SERIAL.close()
+            port_list.set_disconnected()
+            msg = format_serial_error(serial_error)
+            if REC:
+                saved_path = stop_recording()
+                button_rec.set_text('录制曲线')
+                if saved_path:
+                    msg += f"，曲线已保存：{saved_path.name}"
+
         window_surface.blit(background, (0, 0))
         
         render(window_surface)
         draw_temp_cross(window_surface, mouse_pos, get_temp(mouse_pos)[-1])
-        if ERROR is not None:
-            SERIAL.close()
-            port_list.set_disconnected()
-            msg = str(ERROR)
-            ERROR = None
-            if REC:  # 关闭未结束的曲线录制
-                rec_trigger()
         
         if IMG_BUFFER:
             max_temp, min_temp, avg_temp = IMG_BUFFER[:3]

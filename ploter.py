@@ -1,33 +1,42 @@
-import matplotlib.pyplot as plt
+import csv
 import os
-import tkinter as tk
-from tkinter import filedialog
+from app_config import load_config
+
+APP_CONFIG = load_config()
+ROOT = None
+LISTBOX = None
+
+
+def get_pyplot():
+    import matplotlib.pyplot as plt
+    return plt
 
 def load_csv_curv(path:str):
-    with open(path, 'r') as f:
-        x = []
-        lines = f.readlines()
-        labels = lines[0][:-2].split(',')[1::]
-        y = [[] for _ in range(len(lines)-1)]
-        for k, line in enumerate(lines[1:]):
-            data = line[:-2].split(',')
-            x.append(float(data[0]))
-            for point in data[1:]:
-                y[k].append(float(point))
-        return x, y, labels
+    with open(path, 'r', newline='') as f:
+        rows = [row for row in csv.reader(f) if row]
+    labels = [value for value in rows[0][1:] if value != ""]
+    x = []
+    y = []
+    for row in rows[1:]:
+        values = [value for value in row if value != ""]
+        if not values:
+            continue
+        x.append(float(values[0]))
+        y.append([float(point) for point in values[1:]])
+    return x, y, labels
 
 def load_csv_frame(path:str):
-    with open(path, 'r') as f:
-        lines = f.readlines()
-        datas = []
-        for line in lines[1::]:
-            data = line[:-2].split(',')[1::]
-            datas.append([float(point) for point in data])
-        # print(datas)
+    with open(path, 'r', newline='') as f:
+        rows = [row for row in csv.reader(f) if row]
+    datas = []
+    for row in rows[1:]:
+        values = [value for value in row[1:] if value != ""]
+        datas.append([float(point) for point in values])
     return datas[::-1]
 
 def show_frame(_path):
     try:
+        plt = get_pyplot()
         datas = load_csv_frame(_path)
         plt.figure("Tmeperature Frame")
         plt.xlim(0, len(datas[0])-1)
@@ -39,6 +48,7 @@ def show_frame(_path):
 
 def show_curve(_path):
     try:
+        plt = get_pyplot()
         x, y, labels = load_csv_curv(_path)
         print(labels)
         plt.figure()
@@ -52,14 +62,6 @@ def show_curve(_path):
         plt.show()
     except Exception as e:
         print(e)
-
-
-ROOT = tk.Tk()
-ROOT.title("曲线浏览器")
-
-# 创建一个listbox
-LISTBOX = tk.Listbox(ROOT, width=100, height=10)
-LISTBOX.pack()
 
 def list_files():
     # 获取当前目录下的所有文件
@@ -81,6 +83,8 @@ def open_file(event):
         show_frame(selected_file)
 
 def ask_directory():
+    from tkinter import filedialog
+
     # 弹出对话框让用户选择目录
     directory = filedialog.askdirectory()
     # 如果用户选择了目录，更新文件列表
@@ -89,6 +93,17 @@ def ask_directory():
         list_files()
 
 def main():
+    global ROOT, LISTBOX
+    import tkinter as tk
+
+    APP_CONFIG["data_dir"].mkdir(parents=True, exist_ok=True)
+
+    ROOT = tk.Tk()
+    ROOT.title("曲线浏览器")
+
+    LISTBOX = tk.Listbox(ROOT, width=100, height=10)
+    LISTBOX.pack()
+
     # 创建菜单栏
     menu_bar = tk.Menu(ROOT)
     ROOT.config(menu=menu_bar)
@@ -100,7 +115,7 @@ def main():
     # 添加选择目录选项
     file_menu.add_command(label="选择目录", command=ask_directory)
 
-    # 获取当前目录下的所有文件并显示
+    os.chdir(APP_CONFIG["data_dir"])
     list_files()
 
     # 为listbox添加双击事件
